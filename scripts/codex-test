@@ -1,0 +1,92 @@
+#!/bin/bash
+# codex-test — Have Codex generate tests for recent changes (different model = different edge cases)
+#
+# Usage:
+#   codex-test                           # generate tests for uncommitted changes
+#   codex-test --base main               # generate tests for branch diff
+#   codex-test "picker component"        # generate tests for a specific area
+#
+# Codex writes tests with full workspace access so it can read existing
+# test patterns and the implementation code. Output is the test code
+# ready to paste or pipe into a file.
+
+set -uo pipefail
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$REPO_ROOT" ]; then echo "Not in a git repository." >&2; exit 1; fi
+cd "$REPO_ROOT"
+
+BASE=""
+FOCUS=""
+CODEX_MODEL="gpt-5.4"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base)          BASE="$2"; shift 2 ;;
+    --codex-model)   CODEX_MODEL="$2"; shift 2 ;;
+    -*)              shift ;;
+    *)
+      if [ -z "$FOCUS" ]; then FOCUS="$1"; fi
+      shift ;;
+  esac
+done
+
+OUTPUT_FILE=$(mktemp /tmp/codex-test-XXXXXX.md)
+cleanup() { rm -f "$OUTPUT_FILE"; }
+trap cleanup EXIT
+
+if [ -n "$FOCUS" ]; then
+  # Test a specific area
+  PROMPT="Write tests for: $FOCUS
+
+Read the implementation code first. Check how existing tests are structured in this project (framework, naming, file location, assertion style). Follow those patterns exactly.
+
+Focus on:
+- Happy path with realistic inputs
+- Edge cases (null, empty, boundary values)
+- Error paths
+- Behavior, not implementation details
+
+Output the complete test file(s) with file paths."
+
+  codex exec \
+    --model "$CODEX_MODEL" \
+    --sandbox workspace-write \
+    --ephemeral \
+    --output-last-message "$OUTPUT_FILE" \
+    "$PROMPT" >/dev/null 2>&1
+else
+  # Test the diff
+  DIFF_CMD="git diff HEAD"
+  if [ -n "$BASE" ]; then DIFF_CMD="git diff ${BASE}...HEAD"; fi
+
+  DIFF=$(eval "$DIFF_CMD" 2>/dev/null)
+  if [ -z "$DIFF" ]; then
+    echo "No changes to test."
+    exit 0
+  fi
+
+  echo "$DIFF" | codex exec \
+    --model "$CODEX_MODEL" \
+    --sandbox workspace-write \
+    --ephemeral \
+    --output-last-message "$OUTPUT_FILE" \
+    "Write tests for the code changes provided via stdin.
+
+Read the implementation code and existing tests first. Match the project's test framework, naming conventions, and file locations.
+
+Focus on:
+- New behavior introduced by the changes
+- Edge cases specific to the changed code
+- Regression tests for anything that could break
+- Behavior, not implementation details
+
+Output the complete test file(s) with file paths." >/dev/null 2>&1
+fi
+
+if [ -s "$OUTPUT_FILE" ]; then
+  cat "$OUTPUT_FILE"
+else
+  echo "Codex produced no test output."
+  exit 1
+fi

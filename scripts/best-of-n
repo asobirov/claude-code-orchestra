@@ -1,0 +1,210 @@
+#!/bin/bash
+# best-of-n — Spawn N agents implementing the same task, then synthesize the best solution
+#
+# Usage:
+#   best-of-n "add input validation to the property create form"
+#   best-of-n --agents 3 "refactor the picker component to use a state machine"
+#   best-of-n --agents 2 --codex-model gpt-5.4 "fix the N+1 query in property listing"
+#
+# Flow:
+#   1. N agents implement the same task independently (separate contexts)
+#      - Odd agents: Claude    (has full codebase access)
+#      - Even agents: Codex    (works from task description + codebase)
+#   2. A synthesizer agent reviews ALL solutions and creates the best combined version
+#
+# The synthesizer doesn't just pick one — it takes the best ideas from each,
+# identifies where solutions agree (high confidence) and diverge (needs judgment),
+# and produces a concrete recommendation.
+
+set -uo pipefail
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$REPO_ROOT" ]; then
+  echo "Not in a git repository." >&2
+  exit 1
+fi
+cd "$REPO_ROOT"
+
+N=3
+CODEX_MODEL="gpt-5.4"
+TASK=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --agents)        N="$2"; shift 2 ;;
+    --codex-model)   CODEX_MODEL="$2"; shift 2 ;;
+    -*)              shift ;;
+    *)
+      if [ -z "$TASK" ]; then TASK="$1"; fi
+      shift ;;
+  esac
+done
+
+if [ -z "$TASK" ]; then
+  echo "Usage: best-of-n [--agents N] \"<task description>\""
+  exit 1
+fi
+
+echo "Spawning $N agents for: $TASK" >&2
+echo "Agents will implement independently, then a synthesizer picks the best." >&2
+
+# Create output files
+OUTPUTS=()
+for i in $(seq 1 "$N"); do
+  OUTPUTS+=("$(mktemp /tmp/bon-agent${i}-XXXXXX.md)")
+done
+SYNTH_OUT=$(mktemp /tmp/bon-synth-XXXXXX.md)
+
+cleanup() {
+  for f in "${OUTPUTS[@]}"; do rm -f "$f"; done
+  rm -f "$SYNTH_OUT"
+}
+trap cleanup EXIT
+
+PIDS=()
+
+for i in $(seq 1 "$N"); do
+  idx=$((i - 1))
+  out="${OUTPUTS[$idx]}"
+
+  if (( i % 2 == 1 )); then
+    # Odd agents: Claude (full codebase access)
+    PROMPT_FILE=$(mktemp /tmp/bon-prompt-${i}-XXXXXX.txt)
+    cat > "$PROMPT_FILE" <<PROMPT
+You are Agent $i of $N competing to produce the best implementation for a task.
+
+Task: $TASK
+
+Instructions:
+- Read the relevant code first to understand the current state
+- Implement the task completely
+- Explain your approach and key decisions in 3-5 bullet points at the end
+- Focus on correctness, simplicity, and following existing patterns
+- Do NOT just describe what to do — show the actual code changes (file paths + diffs or full replacement code)
+PROMPT
+
+    claude -p "$(cat "$PROMPT_FILE")" \
+      --allowedTools "Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*)" \
+      --output-format text \
+      --no-session-persistence \
+      > "$out" 2>/dev/null &
+    PIDS+=($!)
+    rm -f "$PROMPT_FILE"
+    echo "  Agent $i (Claude) started..." >&2
+  else
+    # Even agents: Codex (workspace read-only — proposes changes without applying)
+    codex exec \
+      --model "$CODEX_MODEL" \
+      --sandbox read-only \
+      --ephemeral \
+      --output-last-message "$out" \
+      "You are Agent $i of $N competing to produce the best implementation for a task.
+
+Task: $TASK
+
+Instructions:
+- Read the relevant code to understand the current state
+- Implement the task completely
+- Explain your approach and key decisions in 3-5 bullet points at the end
+- Focus on correctness, simplicity, and following existing patterns
+- Show the actual code changes (file paths + diffs or full replacement code)" \
+      >/dev/null 2>&1 &
+    PIDS+=($!)
+    echo "  Agent $i (Codex $CODEX_MODEL) started..." >&2
+  fi
+done
+
+# Wait for all implementers
+echo "Waiting for $N agents to complete..." >&2
+FAILURES=0
+for pid in "${PIDS[@]}"; do
+  if ! wait "$pid" 2>/dev/null; then
+    ((FAILURES++))
+  fi
+done
+
+if [ "$FAILURES" -gt 0 ]; then
+  echo "$FAILURES agent(s) had issues (partial results may still be useful)" >&2
+fi
+
+# ── Build synthesizer input ──────────────────────────────────────────
+SYNTH_INPUT=""
+for i in $(seq 1 "$N"); do
+  idx=$((i - 1))
+  out="${OUTPUTS[$idx]}"
+  if (( i % 2 == 1 )); then
+    MODEL_LABEL="Claude"
+  else
+    MODEL_LABEL="Codex ($CODEX_MODEL)"
+  fi
+
+  if [ -s "$out" ]; then
+    SYNTH_INPUT="${SYNTH_INPUT}
+
+=== SOLUTION $i ($MODEL_LABEL) ===
+
+$(cat "$out")
+
+=== END SOLUTION $i ==="
+  else
+    SYNTH_INPUT="${SYNTH_INPUT}
+
+=== SOLUTION $i ($MODEL_LABEL) ===
+(No output — agent may have failed)
+=== END SOLUTION $i ==="
+  fi
+done
+
+# ── Synthesizer: Claude reviews all solutions ────────────────────────
+echo "Running synthesizer..." >&2
+
+SYNTH_PROMPT_FILE=$(mktemp /tmp/bon-synth-prompt-XXXXXX.txt)
+cat > "$SYNTH_PROMPT_FILE" <<PROMPT
+You are a senior engineer synthesizing $N independent implementations of the same task.
+
+Task: $TASK
+
+Below are the solutions from $N agents. Your job:
+
+1. **Compare approaches** — identify where solutions agree (high confidence) and diverge (needs your judgment)
+2. **Take the best from each** — don't just pick one. Combine the strongest ideas.
+3. **Produce the final solution** — show the exact code changes to make (file paths + code)
+4. **Explain your synthesis** — why you chose what you chose, what you rejected and why
+
+$SYNTH_INPUT
+PROMPT
+
+claude -p "$(cat "$SYNTH_PROMPT_FILE")" \
+  --allowedTools "Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*)" \
+  --output-format text \
+  --no-session-persistence \
+  > "$SYNTH_OUT" 2>/dev/null
+
+rm -f "$SYNTH_PROMPT_FILE"
+
+# ── Output ────────────────────────────────────────────────────────────
+echo "# Best-of-$N Synthesis"
+echo ""
+echo "_Task: $TASK_"
+echo ""
+
+for i in $(seq 1 "$N"); do
+  idx=$((i - 1))
+  out="${OUTPUTS[$idx]}"
+  if (( i % 2 == 1 )); then
+    MODEL_LABEL="Claude"
+  else
+    MODEL_LABEL="Codex ($CODEX_MODEL)"
+  fi
+
+  echo "## Solution $i — $MODEL_LABEL"
+  echo ""
+  if [ -s "$out" ]; then cat "$out"; else echo "_No output_"; fi
+  echo ""
+done
+
+echo "---"
+echo ""
+echo "## Synthesized Solution (Best of $N)"
+echo ""
+if [ -s "$SYNTH_OUT" ]; then cat "$SYNTH_OUT"; else echo "_Synthesizer produced no output_"; fi

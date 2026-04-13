@@ -1,0 +1,47 @@
+#!/bin/bash
+# codex-review — Ask Codex to review current changes (completely separate context from Claude)
+# Usage:
+#   codex-review                        # review uncommitted changes
+#   codex-review --base main            # review branch diff against main
+#   codex-review --commit abc123        # review a specific commit
+#   codex-review --base main "focus on auth logic"  # custom review prompt
+#
+# All flags are forwarded to `codex exec review`. The last non-flag argument
+# is treated as a custom review prompt.
+
+set -euo pipefail
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$REPO_ROOT" ]; then echo "Not in a git repository." >&2; exit 1; fi
+cd "$REPO_ROOT"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OUTPUT_FILE=$(mktemp /tmp/codex-review-XXXXXX.md)
+
+# Default: review uncommitted changes, read-only sandbox, ephemeral session
+ARGS=(--sandbox read-only --ephemeral --output-last-message "$OUTPUT_FILE")
+
+# If no explicit --base or --commit flag, default to --uncommitted
+HAS_SCOPE=false
+for arg in "$@"; do
+  case "$arg" in
+    --base|--commit) HAS_SCOPE=true ;;
+  esac
+done
+if [ "$HAS_SCOPE" = false ]; then
+  ARGS+=(--uncommitted)
+fi
+
+# Forward all user arguments
+ARGS+=("$@")
+
+codex exec review "${ARGS[@]}" >/dev/null 2>&1
+
+# Output the review
+if [ -f "$OUTPUT_FILE" ]; then
+  cat "$OUTPUT_FILE"
+  rm -f "$OUTPUT_FILE"
+else
+  echo "Codex review produced no output."
+  exit 1
+fi

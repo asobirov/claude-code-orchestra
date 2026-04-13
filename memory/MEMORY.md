@@ -1,0 +1,11 @@
+- [Agent orchestration setup](agent_orchestration_setup.md) — Claude + Codex multi-agent setup: parallel-review scripts, custom agent definitions, Codex plugin, global permissions
+- [Auto review policy](feedback_auto_review.md) — always run parallel-review after implementation, full-audit before releases; never require manual triggering
+- [Auto skill generation](feedback_auto_skill_gen.md) — after complex multi-step tasks, auto-create reusable skill files in ~/.claude/skills/ for future sessions
+- [Communication style](feedback_communication_style.md) — terse mode: no preambles, no trailing summaries, just do and show results
+- [Review triage](feedback_review_triage.md) — fix only issues from current change, report pre-existing issues without acting, ignore style nits
+- [Autonomous decisions](feedback_autonomous_decisions.md) — pick and go for routine/reversible decisions, only ask on irreversible/high-risk ones
+- [Error recovery](feedback_error_recovery.md) — diagnose and fix in one shot, don't report errors and wait
+- [Typo tolerance](feedback_typo_tolerance.md) — interpret intent, never correct spelling
+- [Codex usage during work](feedback_codex_usage.md) — proactively use Codex mid-task for auth/security validation, when stuck debugging, or when unsure between approaches
+- [Codex gate auto-enable](feedback_codex_gate_bootstrap.md) — offer to enable Codex review gate on new repos during implementation work; gate is persistent once enabled
+- [Phase isolation](feedback_phase_isolation.md) — at phase boundaries prefer subagents for independent work; suggest /compact when context fills up and phase is complete

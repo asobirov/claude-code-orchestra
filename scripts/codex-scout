@@ -1,0 +1,62 @@
+#!/bin/bash
+# codex-scout — Have Codex analyze a code area before you start working on it
+#
+# Usage:
+#   codex-scout "the picker component"
+#   codex-scout "auth middleware and session handling"
+#   codex-scout "property listing API route"
+#
+# Gives you a pre-implementation briefing from a fresh perspective:
+# patterns, gotchas, dependencies, and things to watch out for.
+
+set -uo pipefail
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$REPO_ROOT" ]; then echo "Not in a git repository." >&2; exit 1; fi
+cd "$REPO_ROOT"
+
+AREA=""
+CODEX_MODEL="gpt-5.4"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --codex-model) CODEX_MODEL="$2"; shift 2 ;;
+    -*)            shift ;;
+    *)
+      if [ -z "$AREA" ]; then AREA="$1"; fi
+      shift ;;
+  esac
+done
+
+if [ -z "$AREA" ]; then
+  echo "Usage: codex-scout \"<area to analyze>\""
+  exit 1
+fi
+
+OUTPUT_FILE=$(mktemp /tmp/codex-scout-XXXXXX.md)
+cleanup() { rm -f "$OUTPUT_FILE"; }
+trap cleanup EXIT
+
+codex exec \
+  --model "$CODEX_MODEL" \
+  --sandbox read-only \
+  --ephemeral \
+  --output-last-message "$OUTPUT_FILE" \
+  "Analyze this area of the codebase: $AREA
+
+Find and read the relevant files, then provide a pre-implementation briefing:
+
+1. **Current state** — what exists, how it works, key files and entry points
+2. **Patterns** — how similar things are done elsewhere in this codebase
+3. **Dependencies** — what imports/uses this code, what would break if it changed
+4. **Gotchas** — non-obvious constraints, edge cases, or things that look wrong but are intentional
+5. **Conventions** — naming, file structure, test patterns specific to this area
+
+Keep it concise. This briefing will be given to another agent before implementation." >/dev/null 2>&1
+
+if [ -s "$OUTPUT_FILE" ]; then
+  cat "$OUTPUT_FILE"
+else
+  echo "Codex produced no output."
+  exit 1
+fi

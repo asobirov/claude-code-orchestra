@@ -1,0 +1,219 @@
+#!/bin/bash
+# full-audit — Comprehensive pre-release audit using all available agents
+#
+# Usage:
+#   full-audit                    # audit uncommitted changes
+#   full-audit --base main        # audit full branch diff against main
+#   full-audit --base develop     # audit against develop
+#
+# Runs 5 review passes in parallel:
+#   1. Codex (gpt-5.4)  — Security & correctness
+#   2. Claude            — Architecture & code quality
+#   3. Codex (gpt-5.4)  — Edge cases & test coverage
+#   4. Codex (gpt-5.4)  — Breaking changes & API compatibility
+#   5. Claude            — Release readiness checklist
+#
+# Designed for pre-merge / pre-release final review.
+
+set -uo pipefail
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$REPO_ROOT" ]; then
+  echo "Not in a git repository." >&2
+  exit 1
+fi
+cd "$REPO_ROOT"
+
+BASE=""
+CODEX_MODEL="gpt-5.4"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base)          BASE="$2"; shift 2 ;;
+    --codex-model)   CODEX_MODEL="$2"; shift 2 ;;
+    *)               shift ;;
+  esac
+done
+
+# Build diff command
+DIFF_CMD="git diff HEAD"
+DIFF_LABEL="uncommitted changes"
+if [ -n "$BASE" ]; then
+  DIFF_CMD="git diff ${BASE}...HEAD"
+  DIFF_LABEL="branch diff against $BASE"
+fi
+
+DIFF=$(eval "$DIFF_CMD" 2>/dev/null)
+if [ -z "$DIFF" ]; then
+  echo "No changes to audit."
+  exit 0
+fi
+
+DIFF_LINES=$(echo "$DIFF" | wc -l | tr -d ' ')
+FILE_COUNT=$(eval "$DIFF_CMD --name-only" 2>/dev/null | wc -l | tr -d ' ')
+echo "Starting full audit ($DIFF_LABEL: $FILE_COUNT files, $DIFF_LINES lines of diff)..." >&2
+echo "Running 5 agents in parallel (2 Claude + 3 Codex $CODEX_MODEL)..." >&2
+
+# Temp files
+A1_OUT=$(mktemp /tmp/audit-1-XXXXXX.md)
+A2_OUT=$(mktemp /tmp/audit-2-XXXXXX.md)
+A3_OUT=$(mktemp /tmp/audit-3-XXXXXX.md)
+A4_OUT=$(mktemp /tmp/audit-4-XXXXXX.md)
+A5_OUT=$(mktemp /tmp/audit-5-XXXXXX.md)
+cleanup() { rm -f "$A1_OUT" "$A2_OUT" "$A3_OUT" "$A4_OUT" "$A5_OUT"; }
+trap cleanup EXIT
+
+PIDS=()
+
+# ── Agent 1: Codex — Security & Correctness ──────────────────────────
+echo "$DIFF" | codex exec \
+  --model "$CODEX_MODEL" \
+  --sandbox read-only \
+  --ephemeral \
+  --output-last-message "$A1_OUT" \
+  "You are performing a pre-release security audit. This is a FINAL review before code ships to production. Be thorough.
+
+Review the diff (provided via stdin) for:
+- Security vulnerabilities (injection, XSS, CSRF, auth bypass, secrets exposure, SSRF)
+- Logic errors, off-by-one, null derefs, race conditions
+- Unsafe type casts that could cause runtime crashes
+- Hardcoded credentials, API keys, or tokens
+- Insecure data handling (PII in logs, cleartext storage, overly permissive CORS)
+
+For each finding: state severity (critical/high/medium/low), exact file and line, attack scenario, and fix. If clean, say so in one line." \
+  >/dev/null 2>&1 &
+PIDS+=($!)
+
+# ── Agent 2: Claude — Architecture & Code Quality ────────────────────
+PROMPT2=$(mktemp /tmp/audit-prompt2-XXXXXX.txt)
+cat > "$PROMPT2" <<'PROMPT'
+You are performing a pre-release architecture review. This is a FINAL review before code ships.
+
+Run git diff HEAD (or git diff <base>...HEAD) to see all changes, then review:
+- Do changes follow existing patterns and conventions in the codebase?
+- Are abstractions at the right level? Any god components or leaky abstractions?
+- Is separation of concerns clean (UI vs logic vs data)?
+- Any duplicated logic that should be shared?
+- Are there circular dependencies or tight coupling introduced?
+- Naming consistency with the rest of the codebase
+
+Use Read/Grep/Glob to check how similar things are done elsewhere.
+Be specific: file names, line numbers, concrete suggestions. If architecture is solid, say so in one line.
+PROMPT
+
+claude -p "$(cat "$PROMPT2")" \
+  --allowedTools "Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*),Bash(git branch*)" \
+  --output-format text \
+  --no-session-persistence \
+  > "$A2_OUT" 2>/dev/null &
+PIDS+=($!)
+rm -f "$PROMPT2"
+
+# ── Agent 3: Codex — Edge Cases & Test Coverage ──────────────────────
+echo "$DIFF" | codex exec \
+  --model "$CODEX_MODEL" \
+  --sandbox read-only \
+  --ephemeral \
+  --output-last-message "$A3_OUT" \
+  "You are performing a pre-release test coverage audit. This is a FINAL review before code ships.
+
+Review the diff for:
+- Edge cases not handled (null, undefined, empty arrays, empty strings, unicode, very long inputs, negative numbers, zero, boundary values)
+- Error handling gaps (what happens when network fails, permissions denied, disk full, timeout?)
+- Silent error swallowing (empty catch blocks, ignored promise rejections)
+- Missing input validation at system boundaries (API endpoints, form submissions, deep links)
+- Test coverage gaps: what new behavior is untested? What regression tests are missing?
+- Could these changes break existing functionality?
+
+For each finding: exact file, line, concrete failure scenario, and suggested test case. If coverage looks good, say so in one line." \
+  >/dev/null 2>&1 &
+PIDS+=($!)
+
+# ── Agent 4: Codex — Breaking Changes & API Compatibility ────────────
+echo "$DIFF" | codex exec \
+  --model "$CODEX_MODEL" \
+  --sandbox read-only \
+  --ephemeral \
+  --output-last-message "$A4_OUT" \
+  "You are performing a pre-release compatibility audit. This is a FINAL review before code ships.
+
+Review the diff for:
+- Breaking changes to public APIs, exported types, or shared interfaces
+- Database schema changes that could break existing data or require migrations
+- Changed function signatures that callers might depend on
+- Removed or renamed exports
+- Changed default values or behaviors that downstream code expects
+- Environment variable changes, config format changes
+- Dependency version bumps with known breaking changes
+
+For each finding: state the breaking change, who/what is affected, and whether a migration path exists. If no breaking changes, say so in one line." \
+  >/dev/null 2>&1 &
+PIDS+=($!)
+
+# ── Agent 5: Claude — Release Readiness Checklist ─────────────────────
+PROMPT5=$(mktemp /tmp/audit-prompt5-XXXXXX.txt)
+cat > "$PROMPT5" <<'PROMPT'
+You are performing a pre-release readiness check. Run git diff HEAD and git log to understand all changes, then evaluate:
+
+1. Are there any TODO, FIXME, HACK, or XXX comments in the changed code?
+2. Are there any console.log, debugger, or alert statements left in?
+3. Are there any commented-out code blocks that should be removed?
+4. Do all new features have corresponding tests?
+5. Are error messages user-friendly (not raw stack traces or internal errors)?
+6. Are there any hardcoded URLs, IPs, or environment-specific values?
+7. Are new dependencies justified? Any unnecessary additions?
+8. Is the commit history clean (no WIP commits, no fixup commits that should be squashed)?
+
+Output a checklist with pass/fail for each item. For failures, reference specific files and lines.
+PROMPT
+
+claude -p "$(cat "$PROMPT5")" \
+  --allowedTools "Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*),Bash(git branch*)" \
+  --output-format text \
+  --no-session-persistence \
+  > "$A5_OUT" 2>/dev/null &
+PIDS+=($!)
+rm -f "$PROMPT5"
+
+# Wait for all agents
+echo "Waiting for ${#PIDS[@]} agents to complete..." >&2
+FAILURES=0
+for pid in "${PIDS[@]}"; do
+  if ! wait "$pid" 2>/dev/null; then
+    ((FAILURES++))
+  fi
+done
+
+if [ "$FAILURES" -gt 0 ]; then
+  echo "$FAILURES agent(s) had issues (partial results may still be useful)" >&2
+fi
+
+# ── Aggregate results ─────────────────────────────────────────────────
+echo "# Full Pre-Release Audit"
+echo ""
+echo "_${DIFF_LABEL}: ${FILE_COUNT} files changed, ${DIFF_LINES} lines of diff_"
+echo ""
+
+echo "## 1. Security & Correctness (Codex $CODEX_MODEL)"
+echo ""
+if [ -s "$A1_OUT" ]; then cat "$A1_OUT"; else echo "_No output_"; fi
+echo ""
+
+echo "## 2. Architecture & Code Quality (Claude)"
+echo ""
+if [ -s "$A2_OUT" ]; then cat "$A2_OUT"; else echo "_No output_"; fi
+echo ""
+
+echo "## 3. Edge Cases & Test Coverage (Codex $CODEX_MODEL)"
+echo ""
+if [ -s "$A3_OUT" ]; then cat "$A3_OUT"; else echo "_No output_"; fi
+echo ""
+
+echo "## 4. Breaking Changes & API Compatibility (Codex $CODEX_MODEL)"
+echo ""
+if [ -s "$A4_OUT" ]; then cat "$A4_OUT"; else echo "_No output_"; fi
+echo ""
+
+echo "## 5. Release Readiness Checklist (Claude)"
+echo ""
+if [ -s "$A5_OUT" ]; then cat "$A5_OUT"; else echo "_No output_"; fi

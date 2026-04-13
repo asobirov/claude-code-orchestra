@@ -1,0 +1,62 @@
+#!/bin/bash
+# codex-validate — Run Codex with a custom prompt against the codebase (separate context)
+# Usage:
+#   codex-validate "check if the API routes handle auth correctly"
+#   codex-validate "run the tests and report failures"
+#   echo "context" | codex-validate "analyze this"
+#
+# Runs in read-only sandbox by default. Pass --full-auto for write access.
+
+set -euo pipefail
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$REPO_ROOT" ]; then echo "Not in a git repository." >&2; exit 1; fi
+cd "$REPO_ROOT"
+
+OUTPUT_FILE=$(mktemp /tmp/codex-validate-XXXXXX.md)
+
+PROMPT=""
+EXTRA_ARGS=()
+SANDBOX="read-only"
+
+for arg in "$@"; do
+  case "$arg" in
+    --full-auto)
+      SANDBOX="workspace-write"
+      ;;
+    --sandbox)
+      # let the next arg be handled by codex directly
+      EXTRA_ARGS+=("$arg")
+      ;;
+    -*)
+      EXTRA_ARGS+=("$arg")
+      ;;
+    *)
+      if [ -z "$PROMPT" ]; then
+        PROMPT="$arg"
+      else
+        EXTRA_ARGS+=("$arg")
+      fi
+      ;;
+  esac
+done
+
+if [ -z "$PROMPT" ]; then
+  echo "Usage: codex-validate \"<prompt>\" [--full-auto] [extra codex flags...]"
+  exit 1
+fi
+
+codex exec \
+  --sandbox "$SANDBOX" \
+  --ephemeral \
+  --output-last-message "$OUTPUT_FILE" \
+  "${EXTRA_ARGS[@]}" \
+  "$PROMPT" >/dev/null 2>&1
+
+if [ -f "$OUTPUT_FILE" ]; then
+  cat "$OUTPUT_FILE"
+  rm -f "$OUTPUT_FILE"
+else
+  echo "Codex produced no output."
+  exit 1
+fi

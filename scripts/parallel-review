@@ -1,0 +1,246 @@
+#!/bin/bash
+# parallel-review — Dynamic multi-agent review that scales with change complexity
+#
+# Usage:
+#   parallel-review                          # auto-score and review uncommitted changes
+#   parallel-review --base main              # review branch diff against main
+#   parallel-review --agents 3               # force 3 agents (override auto-scoring)
+#   parallel-review --commit abc123          # review a specific commit
+#   parallel-review --codex-model gpt-5.4    # override Codex model
+#
+# Auto-scoring (when --agents is not set):
+#   Score 0  → formatting only, skip review
+#   Score 1  → single Codex review (security + correctness)
+#   Score 2  → 2 agents (Codex security + Claude architecture)
+#   Score 3+ → 3 agents (+ Codex edge cases & testing)
+#
+# Score is based on: lines changed, files touched, sensitive patterns
+# (auth, API, database, env, secrets, dependencies).
+
+set -uo pipefail
+
+# Ensure we're in a git repo — find the root and cd there
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$REPO_ROOT" ]; then
+  echo "Not in a git repository." >&2
+  exit 1
+fi
+cd "$REPO_ROOT"
+
+BASE=""
+COMMIT=""
+AGENTS=""  # empty = auto-score
+CODEX_MODEL="gpt-5.4"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base)          BASE="$2"; shift 2 ;;
+    --commit)        COMMIT="$2"; shift 2 ;;
+    --agents)        AGENTS="$2"; shift 2 ;;
+    --codex-model)   CODEX_MODEL="$2"; shift 2 ;;
+    *)               shift ;;
+  esac
+done
+
+# Build diff command based on scope
+DIFF_CMD="git diff HEAD"
+STAT_CMD="git diff HEAD --stat"
+NAME_CMD="git diff HEAD --name-only"
+if [ -n "$COMMIT" ]; then
+  DIFF_CMD="git show $COMMIT"
+  STAT_CMD="git show $COMMIT --stat"
+  NAME_CMD="git show $COMMIT --name-only"
+elif [ -n "$BASE" ]; then
+  DIFF_CMD="git diff ${BASE}...HEAD"
+  STAT_CMD="git diff ${BASE}...HEAD --stat"
+  NAME_CMD="git diff ${BASE}...HEAD --name-only"
+fi
+
+# Get the diff
+DIFF=$(eval "$DIFF_CMD" 2>/dev/null)
+if [ -z "$DIFF" ]; then
+  echo "No changes to review."
+  exit 0
+fi
+
+DIFF_LINES=$(echo "$DIFF" | wc -l | tr -d ' ')
+FILE_COUNT=$(eval "$NAME_CMD" 2>/dev/null | wc -l | tr -d ' ')
+CHANGED_FILES=$(eval "$NAME_CMD" 2>/dev/null)
+
+# ── Auto-score change complexity ──────────────────────────────────────
+score_changes() {
+  local score=0
+
+  # Check if formatting-only (heuristic: only whitespace/ordering changes in the actual code lines)
+  local code_changes
+  code_changes=$(echo "$DIFF" | grep -E '^[+-]' | grep -v '^[+-]{3}' | grep -v '^[+-][[:space:]]*$' | grep -v '^[+-][[:space:]]*[/*]' | grep -v '^[+-][[:space:]]*\*' | grep -v '^[+-][[:space:]]*\/\/' | wc -l | tr -d ' ')
+
+  if [ "$code_changes" -lt 5 ]; then
+    echo 0
+    return
+  fi
+
+  # Lines changed scoring
+  if [ "$DIFF_LINES" -gt 500 ]; then
+    score=$((score + 3))
+  elif [ "$DIFF_LINES" -gt 200 ]; then
+    score=$((score + 2))
+  elif [ "$DIFF_LINES" -gt 50 ]; then
+    score=$((score + 1))
+  fi
+
+  # Files touched scoring
+  if [ "$FILE_COUNT" -gt 10 ]; then
+    score=$((score + 2))
+  elif [ "$FILE_COUNT" -gt 5 ]; then
+    score=$((score + 1))
+  fi
+
+  # Sensitive patterns scoring (+1 each, capped at +3)
+  local sensitive=0
+  if echo "$CHANGED_FILES" | grep -qiE '(auth|login|session|token|password|credential)'; then
+    sensitive=$((sensitive + 1))
+  fi
+  if echo "$CHANGED_FILES" | grep -qiE '(api|route|endpoint|middleware|handler)'; then
+    sensitive=$((sensitive + 1))
+  fi
+  if echo "$CHANGED_FILES" | grep -qiE '(database|migration|schema|drizzle|prisma|sql)'; then
+    sensitive=$((sensitive + 1))
+  fi
+  if echo "$CHANGED_FILES" | grep -qiE '(\.env|secret|key|config\.ts|config\.js)'; then
+    sensitive=$((sensitive + 1))
+  fi
+  if echo "$CHANGED_FILES" | grep -qiE '(package\.json|pubspec\.yaml|Gemfile|requirements\.txt)'; then
+    sensitive=$((sensitive + 1))
+  fi
+  if [ "$sensitive" -gt 3 ]; then sensitive=3; fi
+  score=$((score + sensitive))
+
+  echo "$score"
+}
+
+if [ -z "$AGENTS" ]; then
+  SCORE=$(score_changes)
+
+  if [ "$SCORE" -eq 0 ]; then
+    echo "Formatting-only changes (score: 0). Skipping review." >&2
+    exit 0
+  elif [ "$SCORE" -le 1 ]; then
+    AGENTS=1
+  elif [ "$SCORE" -le 2 ]; then
+    AGENTS=2
+  else
+    AGENTS=3
+  fi
+
+  echo "Change complexity score: $SCORE → $AGENTS agent(s)" >&2
+fi
+
+echo "Starting parallel review ($AGENTS agent(s), codex: $CODEX_MODEL) — $FILE_COUNT files, $DIFF_LINES lines of diff..." >&2
+
+# Temp files for each agent
+AGENT1_OUT=$(mktemp /tmp/review-agent1-XXXXXX.md)
+AGENT2_OUT=$(mktemp /tmp/review-agent2-XXXXXX.md)
+AGENT3_OUT=$(mktemp /tmp/review-agent3-XXXXXX.md)
+cleanup() { rm -f "$AGENT1_OUT" "$AGENT2_OUT" "$AGENT3_OUT"; }
+trap cleanup EXIT
+
+PIDS=()
+
+# ── Agent 1: Codex — Security & Correctness (always runs) ────────────
+echo "$DIFF" | codex exec \
+  --model "$CODEX_MODEL" \
+  --sandbox read-only \
+  --ephemeral \
+  --output-last-message "$AGENT1_OUT" \
+  "You are reviewing code changes. Focus ONLY on:
+- Security vulnerabilities (injection, XSS, auth bypass, secrets exposure)
+- Logic errors and bugs
+- Race conditions and concurrency issues
+- Correctness of algorithms and data transformations
+- Type safety issues
+
+The diff is provided via stdin. Be specific: file names, line numbers, concrete impact. Skip style nits. If everything is fine, say so briefly." \
+  >/dev/null 2>&1 &
+PIDS+=($!)
+
+# ── Agent 2: Claude — Architecture & Code Quality (score >= 2) ───────
+if [ "$AGENTS" -ge 2 ]; then
+  CLAUDE_PROMPT_FILE=$(mktemp /tmp/claude-prompt-XXXXXX.txt)
+  cat > "$CLAUDE_PROMPT_FILE" <<'PROMPT'
+You are reviewing code changes as part of a parallel review team. Another agent is reviewing for security and bugs — your focus is different.
+
+Run git diff HEAD to see the changes, then review with focus on:
+- Architecture and design patterns — do the changes fit the codebase?
+- Code quality: naming, abstractions, separation of concerns
+- Performance implications (N+1 queries, unnecessary re-renders, quadratic where linear is possible)
+- Whether the approach is the right one, or if there is a simpler way
+- Consistency with existing codebase conventions
+
+You have read access to the full codebase — use it to check how similar things are done elsewhere.
+
+Be specific: file names, line numbers, concrete suggestions. Skip security (another agent handles that). If the code is solid, say so briefly.
+PROMPT
+
+  claude -p "$(cat "$CLAUDE_PROMPT_FILE")" \
+    --allowedTools "Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*),Bash(git branch*)" \
+    --output-format text \
+    --no-session-persistence \
+    > "$AGENT2_OUT" 2>/dev/null &
+  PIDS+=($!)
+  rm -f "$CLAUDE_PROMPT_FILE"
+fi
+
+# ── Agent 3: Codex — Edge Cases & Testing (score >= 3) ───────────────
+if [ "$AGENTS" -ge 3 ]; then
+  echo "$DIFF" | codex exec \
+    --model "$CODEX_MODEL" \
+    --sandbox read-only \
+    --ephemeral \
+    --output-last-message "$AGENT3_OUT" \
+    "You are reviewing code changes. Focus ONLY on:
+- Edge cases and boundary conditions (null, empty, overflow, unicode, etc.)
+- Error handling: are failures handled gracefully? Are errors swallowed silently?
+- Missing input validation at system boundaries
+- Test coverage gaps: what should be tested that is not?
+- Potential regressions: could these changes break existing functionality?
+
+The diff is provided via stdin. Be specific: file names, line numbers, concrete scenarios that could fail. Skip style and architecture. If coverage looks good, say so briefly." \
+    >/dev/null 2>&1 &
+  PIDS+=($!)
+fi
+
+# Wait for all agents
+echo "Waiting for ${#PIDS[@]} agent(s) to complete..." >&2
+FAILURES=0
+for pid in "${PIDS[@]}"; do
+  if ! wait "$pid" 2>/dev/null; then
+    ((FAILURES++))
+  fi
+done
+
+if [ "$FAILURES" -gt 0 ]; then
+  echo "$FAILURES agent(s) had issues (partial results may still be useful)" >&2
+fi
+
+# ── Aggregate results ─────────────────────────────────────────────────
+echo "# Parallel Review (score: ${SCORE:-manual}, $AGENTS agent(s))"
+echo ""
+
+echo "## Agent 1 — Codex ($CODEX_MODEL): Security & Correctness"
+echo ""
+if [ -s "$AGENT1_OUT" ]; then cat "$AGENT1_OUT"; else echo "_No output_"; fi
+
+if [ "$AGENTS" -ge 2 ]; then
+  echo ""
+  echo "## Agent 2 — Claude: Architecture & Code Quality"
+  echo ""
+  if [ -s "$AGENT2_OUT" ]; then cat "$AGENT2_OUT"; else echo "_No output_"; fi
+fi
+
+if [ "$AGENTS" -ge 3 ]; then
+  echo ""
+  echo "## Agent 3 — Codex ($CODEX_MODEL): Edge Cases & Testing"
+  echo ""
+  if [ -s "$AGENT3_OUT" ]; then cat "$AGENT3_OUT"; else echo "_No output_"; fi
+fi
