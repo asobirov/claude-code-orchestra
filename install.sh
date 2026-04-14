@@ -12,6 +12,7 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 CLAUDE_DIR="$HOME/.claude"
 SCRIPTS_DIR="$CLAUDE_DIR/scripts"
 AGENTS_DIR="$CLAUDE_DIR/agents"
+SKILLS_DIR="$CLAUDE_DIR/skills"
 MEMORY_DIR=""  # detected below
 SETTINGS_FILE="$CLAUDE_DIR/settings.json"
 
@@ -109,6 +110,33 @@ for agent in "$REPO_DIR"/agents/*.md; do
   fi
   cp "$agent" "$target"
   success "Installed agent: $name"
+done
+
+# ── Install skills ────────────────────────────────────────────────────
+info "Installing skills to $SKILLS_DIR"
+mkdir -p "$SKILLS_DIR"
+
+for skill_dir in "$REPO_DIR"/skills/*/; do
+  [ -d "$skill_dir" ] || continue
+  skill_name=$(basename "$skill_dir")
+  target="$SKILLS_DIR/$skill_name"
+
+  if [ -d "$target" ]; then
+    # Compare SKILL.md if both exist
+    if [ -f "$target/SKILL.md" ] && [ -f "$skill_dir/SKILL.md" ] && ! cmp -s "$skill_dir/SKILL.md" "$target/SKILL.md"; then
+      warn "Skill $skill_name already exists and differs. Overwrite? (y/N)"
+      read -r -n 1 reply
+      echo ""
+      if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+        warn "Skipped skill: $skill_name"
+        continue
+      fi
+    fi
+  fi
+
+  mkdir -p "$target"
+  cp -R "$skill_dir"/* "$target"/
+  success "Installed skill: $skill_name"
 done
 
 # ── Install memory files ──────────────────────────────────────────────
@@ -213,4 +241,7 @@ ls -1 "$SCRIPTS_DIR" | sed 's/^/  /'
 echo ""
 echo "Agents installed:"
 ls -1 "$AGENTS_DIR" | sed 's/^/  /'
+echo ""
+echo "Skills installed:"
+ls -1 "$SKILLS_DIR" | sed 's/^/  /'
 echo ""

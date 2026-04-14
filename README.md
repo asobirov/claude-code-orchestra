@@ -27,6 +27,10 @@ A multi-agent workflow setup for [Claude Code](https://claude.com/claude-code), 
 
 Claude Code auto-discovers these and spawns them as subagents when relevant. You can also invoke them explicitly.
 
+### Skill (`~/.claude/skills/claude-code-orchestra/`)
+
+A single auto-discoverable skill (`claude-code-orchestra`) that documents every script, agent, and workflow in one place. Claude Code reads the skill description at session start and loads the full content when relevant. This is the canonical reference for how to use the setup — the behavioral memory tells Claude *when* to act, the skill tells it *how*.
+
 ### Behavioral memory (`~/.claude/projects/<home>/memory/`)
 
 Rules every future Claude Code session picks up automatically:
@@ -54,9 +58,10 @@ The installer:
 
 1. Copies scripts to `~/.claude/scripts/` and makes them executable
 2. Copies agent definitions to `~/.claude/agents/`
-3. Copies behavioral memory files and merges `MEMORY.md` with any existing index
-4. Adds required Bash permissions to `~/.claude/settings.json` via `jq`
-5. Installs the official Codex plugin (`openai/codex-plugin-cc`) if not already present
+3. Copies the skill to `~/.claude/skills/claude-code-orchestra/`
+4. Copies behavioral memory files and merges `MEMORY.md` with any existing index
+5. Adds required Bash permissions to `~/.claude/settings.json` via `jq`
+6. Installs the official Codex plugin (`openai/codex-plugin-cc`) if not already present
 
 Existing files that differ are never silently overwritten — you're prompted.
 

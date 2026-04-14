@@ -24,6 +24,7 @@ Run the installer:
 It handles:
 - Copying `scripts/` → `~/.claude/scripts/` with +x
 - Copying `agents/` → `~/.claude/agents/`
+- Copying `skills/` → `~/.claude/skills/`
 - Copying `memory/` → `~/.claude/projects/<encoded-home>/memory/`, merging `MEMORY.md`
 - Adding required Bash permissions to `~/.claude/settings.json` via `jq`
 - Installing the Codex plugin (`openai/codex-plugin-cc`) if not present
@@ -40,6 +41,9 @@ ls -l ~/.claude/scripts/ | grep -E "parallel-review|full-audit|best-of-n|codex-"
 
 # Agents installed
 ls ~/.claude/agents/
+
+# Skill installed
+ls ~/.claude/skills/claude-code-orchestra/
 
 # Memory files installed
 ls ~/.claude/projects/*/memory/feedback_*.md
