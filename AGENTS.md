@@ -37,7 +37,7 @@ After `install.sh` completes, verify:
 
 ```bash
 # Scripts installed and executable
-ls -l ~/.claude/scripts/ | grep -E "parallel-review|full-audit|best-of-n|codex-"
+ls -l ~/.claude/scripts/ | grep -E "parallel-review|full-audit|agents.env"
 
 # Agents installed
 ls ~/.claude/agents/
@@ -75,7 +75,7 @@ The gate is persistent — enabled once per repo path, applies forever.
 
 1. **Most of this runs automatically**. The behavioral memory files tell future Claude sessions to run `parallel-review` after implementation, triage findings, and auto-generate skills. The user doesn't need to manually trigger anything.
 
-2. **Scripts are available as Bash commands**, pre-approved in settings. Any Claude session can call `~/.claude/scripts/parallel-review`, `~/.claude/scripts/best-of-n "task"`, etc. without permission prompts.
+2. **Scripts are available as Bash commands**, pre-approved in settings. Any Claude session can call `~/.claude/scripts/parallel-review` or `~/.claude/scripts/full-audit` without permission prompts.
 
 3. **Custom agents auto-spawn**. Claude Code will automatically use `security-reviewer`, `perf-auditor`, `arch-reviewer`, and `test-writer` when it sees code that matches their descriptions.
 
@@ -94,7 +94,7 @@ The gate is persistent — enabled once per repo path, applies forever.
 No uninstaller is provided. Remove manually:
 
 ```bash
-rm ~/.claude/scripts/{parallel-review,full-audit,best-of-n,codex-review,codex-validate,codex-scout,codex-test}
+rm ~/.claude/scripts/{parallel-review,full-audit,agents.env}
 rm ~/.claude/agents/{security-reviewer,perf-auditor,arch-reviewer,test-writer}.md
 rm ~/.claude/projects/*/memory/feedback_{auto_review,auto_skill_gen,communication_style,review_triage,autonomous_decisions,error_recovery,typo_tolerance,codex_usage,codex_gate_bootstrap,phase_isolation}.md
 rm ~/.claude/projects/*/memory/agent_orchestration_setup.md

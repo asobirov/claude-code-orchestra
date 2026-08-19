@@ -1,33 +1,28 @@
 ---
 name: when to use Codex during normal work
-description: Claude should proactively call Codex (via scripts or plugin) throughout the workflow — scouting before implementation, validating during, testing and reviewing after.
+description: Claude should bring Codex in for cross-model review after implementation and before release; ad-hoc Codex work goes through the plugin commands, not standalone scripts.
 type: feedback
+originSessionId: 0b3a4686-3fdb-4c1f-9c4a-cac1f0fabc27
 ---
-Codex provides a different model's perspective with completely separate context. Use it throughout the workflow, not just at review time:
+Codex provides a different model's perspective with completely separate context.
 
-**Before implementation — scout:**
-- Run `~/.claude/scripts/codex-scout "area description"` before starting complex tasks
-- Codex analyzes the code area and surfaces patterns, dependencies, gotchas
-- Use the briefing to avoid wrong-direction implementations
+**After implementation — review:**
+- Run `~/.claude/scripts/parallel-review` (auto, cost-proportional) — 1-3 agents, always at least one Codex
 
-**During implementation — validate:**
-- Run `~/.claude/scripts/codex-validate "check if [specific concern]"` when writing auth, permissions, security-sensitive logic, or complex data mutations
-- Use `/codex:rescue` when stuck debugging after 3+ attempts — fresh context often finds what you can't
+**Before release:**
+- Run `~/.claude/scripts/full-audit --base main` — 5 agents (3 Codex + 2 Claude)
 
-**After implementation — test + review:**
-- Run `~/.claude/scripts/codex-test` to have Codex generate tests from a different model's assumptions (different edge case coverage than Claude's test-writer agent)
-- Run `~/.claude/scripts/parallel-review` (auto, cost-proportional) for the review pass
-- Codex Stop hook review gate fires automatically on session end
+**Ad-hoc Codex during work:**
+- `/codex:rescue` when stuck debugging after 3+ attempts — fresh context often finds what you can't
+- `/codex:review`, `/codex:adversarial-review` for a standalone Codex pass
+- `codex exec --sandbox read-only --ephemeral "<prompt>"` for a one-off question
 
 **Cross-model rule:** When spawning multiple agents for any task (review, implementation, research), always include at least 1 Codex agent. Never run an all-Claude multi-agent pass — the whole point is cross-model diversity.
 
-**Don't use Codex for:**
-- Single-agent routine confident changes, formatting, mechanical tasks
+**Don't use Codex for:** single-agent routine confident changes, formatting, mechanical tasks.
 
 **Why:** Different models catch different things. Codex with separate context spots issues Claude misses because Claude's context is loaded with implementation details. Distributes token usage across providers.
 
-**How to apply:** Match the phase:
-- Starting complex task → `codex-scout`
-- Writing sensitive code → `codex-validate`
-- Done implementing → `codex-test` + `parallel-review`
-- Stuck → `/codex:rescue`
+**How to apply:** Done implementing → `parallel-review`. Pre-release → `full-audit`. Stuck → `/codex:rescue`.
+
+The standalone `codex-scout` / `codex-validate` / `codex-test` / `codex-review` / `best-of-n` scripts were removed on 2026-08-19 — zero runs in two months of transcripts. See [[agent_orchestration_setup]]. Don't re-add references to them; if a phase genuinely needs one, restore it from `~/dev/claude-code-orchestra/scripts/archive/` AND give it a CLAUDE.md trigger, or it will go unused again.

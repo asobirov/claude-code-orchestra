@@ -10,11 +10,13 @@ A multi-agent workflow setup for [Claude Code](https://claude.com/claude-code), 
 |---|---|
 | `parallel-review` | Cost-proportional review. Auto-scores change complexity (lines, files, sensitive patterns) and spawns 1-3 agents accordingly. Score 0 skips entirely, score 3+ runs full 2-Codex + 1-Claude pass. |
 | `full-audit` | Pre-release audit with 5 agents (3 Codex + 2 Claude): security, architecture, edge cases, breaking changes, release-readiness checklist. |
-| `best-of-n` | Spawn N agents implementing the same task independently, then a synthesizer picks the best ideas from each. |
-| `codex-scout` | Pre-implementation briefing: Codex analyzes a code area and surfaces patterns, dependencies, gotchas before you start. |
-| `codex-test` | Codex generates tests for recent changes or a specific area. Different model = different edge case assumptions. |
-| `codex-review` | Quick single-agent Codex review. |
-| `codex-validate` | Ad-hoc Codex task with a custom prompt, read-only sandbox by default. |
+| `agents.env` | Shared model defaults sourced by both scripts. Seeded on install, never clobbered. |
+
+`scripts/archive/` holds five retired scripts (`best-of-n`, `codex-scout`, `codex-test`,
+`codex-review`, `codex-validate`). They were cut on 2026-08-19 after logging zero runs in two
+months of transcripts, against 151 for `parallel-review` and 8 for `full-audit`. `install.sh`
+skips the archive. Restore one with a `cp` — but give it a `CLAUDE.md` trigger at the same
+time, since a tool without one demonstrably never gets reached for.
 
 ### Agents (`~/.claude/agents/`)
 
@@ -96,9 +98,6 @@ Post-implementation
 
 Pre-release
   └─ full-audit --base main — 5-agent comprehensive audit
-
-Complex / ambiguous tasks
-  └─ best-of-n "task description" — N competing implementations + synthesizer
 ```
 
 ## Why multi-agent + cross-model
@@ -114,11 +113,27 @@ Different models have different blind spots. Running Claude and Codex in paralle
 
 - Not a fine-tuning or RL setup. All improvement is via skill accumulation and behavioral memory.
 - Not an IDE or GUI. It's a set of scripts and config files that integrate with the existing Claude Code CLI.
-- Not coupled to any one model. Codex model is configurable (`--codex-model`), Claude uses whatever your session is running.
+- Not coupled to any one model. Both sides are configurable per script or globally in `scripts/agents.env`.
+
+## Models
+
+Defaults live in one place — `~/.claude/scripts/agents.env`, sourced by every script:
+
+| Side | Default | Knob |
+|---|---|---|
+| Codex | `gpt-5.6-sol`, effort `high` | `--codex-model` / `--codex-effort`, or `ORCHESTRA_CODEX_MODEL` / `ORCHESTRA_CODEX_EFFORT` |
+| Claude | `opus` (alias → latest frontier Opus), effort `high` | `--claude-model` / `--claude-effort`, or `ORCHESTRA_CLAUDE_MODEL` / `ORCHESTRA_CLAUDE_EFFORT` |
+
+Precedence: CLI flag > `ORCHESTRA_*` env var > `agents.env` > in-script fallback.
+
+The `ORCHESTRA_` prefix matters: Claude Code exports `CLAUDE_EFFORT` into every child
+process, so unprefixed names would make these scripts silently inherit the parent
+session's effort instead of their own. Use `opus[1m]` for the 1M-context variant on
+very large diffs.
 
 ## Customizing
 
-- **Change Codex model**: edit `~/.codex/config.toml` or pass `--codex-model <name>` to any script
+- **Change models**: edit `scripts/agents.env` (applies to every script), or pass `--codex-model` / `--claude-model` per invocation
 - **Disable auto-review**: remove `feedback_auto_review.md` from the memory directory
 - **Tune scoring thresholds**: edit `score_changes()` in `parallel-review`
 - **Add new agents**: drop a markdown file into `~/.claude/agents/` with the same YAML frontmatter format

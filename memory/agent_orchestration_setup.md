@@ -1,31 +1,30 @@
 ---
 name: agent orchestration setup
-description: Multi-agent setup — Claude + Codex integration, parallel review scripts, custom agent definitions, and Codex plugin. Describes the scripts in ~/.claude/scripts/ and agents in ~/.claude/agents/.
+description: User's multi-agent setup — Claude + Codex integration, the two review scripts in ~/.claude/scripts/, custom agent definitions, and the Codex plugin. Includes which models the scripts drive and where defaults live.
 type: project
+originSessionId: 0b3a4686-3fdb-4c1f-9c4a-cac1f0fabc27
 ---
-Multi-agent orchestration setup installed from claude-code-orchestra:
+Multi-agent orchestration setup, trimmed to what actually gets used (as of 2026-08-19).
 
 **Scripts** in `~/.claude/scripts/`:
-- `codex-review` — single-agent Codex review of current changes
-- `codex-validate` — run Codex with a custom prompt against the codebase (read-only sandbox)
-- `parallel-review` — **cost-proportional**: auto-scores change complexity (lines, files, sensitive patterns), then spawns 1-3 agents accordingly. Score 0 = skip (formatting only), score 1 = 1 Codex, score 2 = Codex + Claude, score 3+ = full 3 agents. Override with `--agents N`.
-- `full-audit` — comprehensive pre-release audit, runs 5 agents (3 Codex + 2 Claude): security, architecture, edge cases, breaking changes, and release readiness checklist. Use with `--base main` for branch audits.
-- `best-of-n` — spawn N agents (alternating Claude/Codex) implementing the same task independently, then a synthesizer agent combines the best from all solutions. Use for complex or ambiguous tasks where multiple approaches could work.
-- `codex-scout` — pre-implementation briefing: Codex analyzes a code area and surfaces patterns, dependencies, gotchas before you start working. Use for complex/unfamiliar areas.
-- `codex-test` — Codex generates tests for recent changes or a specific area. Different model = different edge case assumptions than Claude's test-writer agent.
+- `parallel-review` — **cost-proportional**: auto-scores change complexity (lines, files, sensitive patterns), then spawns 1-3 agents. Score 0 = skip (formatting only), 1 = 1 Codex, 2 = Codex + Claude, 3+ = full 3 agents. Override with `--agents N` (1-3).
+- `full-audit` — pre-release audit, 5 agents (3 Codex + 2 Claude): security, architecture, edge cases, breaking changes, release readiness. Use `--base main` for branch audits.
+- `agents.env` — the single place model defaults live. Codex `gpt-5.6-sol` effort `high`; Claude `opus` effort `high`. Precedence: CLI flag > `ORCHESTRA_*` env var > `agents.env` > in-script fallback.
 
-**Why:** User wants Claude as the manager that can call in Codex for validation with completely separate context. Codex sees only the diff, Claude sees the full codebase. Different models catch different things.
+Override per run with `--codex-model` / `--codex-effort` / `--claude-model` / `--claude-effort`.
 
-**How to apply:** `parallel-review` runs automatically after implementation tasks (see feedback_auto_review.md). `full-audit --base main` for pre-release. Permissions are pre-approved in global settings.json.
+**The env var prefix is load-bearing:** it's `ORCHESTRA_CLAUDE_EFFORT`, not `CLAUDE_EFFORT`. Claude Code exports `CLAUDE_EFFORT` into every child process, so the unprefixed name makes the review agents silently inherit the parent session's effort instead of their own.
 
-**Codex review gate** — enable per-repo via the Codex plugin Stop hook. Fires automatically when Claude tries to stop, blocks if Codex finds issues. See feedback_codex_gate_bootstrap.md.
+**Trimmed 2026-08-19:** `best-of-n`, `codex-scout`, `codex-test`, `codex-review`, `codex-validate` were removed — 0 runs in ~2 months of transcripts (151 for `parallel-review`, 8 for `full-audit` over the same window). Fixed versions are archived at `~/dev/claude-code-orchestra/scripts/archive/`.
 
-**Custom Agents** in `~/.claude/agents/`:
-- `security-reviewer` — read-only, OWASP-focused vulnerability scanning
-- `perf-auditor` — read-only, React/RN performance issues
-- `arch-reviewer` — read-only, architectural fit, pattern consistency, and blast radius analysis (traces callers/imports of changed code)
-- `test-writer` — read/write, generates tests following project conventions
+**Why only those two survived:** usage tracks the `~/.claude/CLAUDE.md` mandate, not the skill description. `parallel-review` and `full-audit` are the two CLAUDE.md requires. "Use PROACTIVELY when…" in a SKILL.md drives nothing. Adding a tool without a CLAUDE.md trigger means it won't get reached for. See [[feedback_codex_usage]].
 
-**Codex Plugin** — `codex@openai-codex` installed at user scope. Provides `/codex:review`, `/codex:adversarial-review`, `/codex:rescue`.
+**Custom Agents** in `~/.claude/agents/` — `security-reviewer`, `perf-auditor`, `arch-reviewer`, `test-writer`. Kept deliberately despite near-zero invocation (1 in two months).
 
-**Codex CLI** — `brew install --cask codex` or `npm install -g @openai/codex`. Default model configurable in `~/.codex/config.toml`.
+**Codex Plugin** — `codex@openai-codex` v1.0.3 at user scope: `/codex:review`, `/codex:adversarial-review`, `/codex:rescue`.
+
+**Codex CLI** — `~/.codex/config.toml` sets `gpt-5.6-sol`, effort `high`, pragmatic personality; installed at /opt/homebrew/bin/codex.
+
+**Source repo** — `~/dev/claude-code-orchestra` (install.sh copies scripts/agents/memory into ~/.claude/). `agents.env` is seeded but never clobbered on reinstall.
+
+**User preference:** Skipped `type: "prompt"` PostToolUse hooks — parallel-review at the end is sufficient, no need for per-edit semantic checks.

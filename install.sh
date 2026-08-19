@@ -76,8 +76,25 @@ info "Installing scripts to $SCRIPTS_DIR"
 mkdir -p "$SCRIPTS_DIR"
 
 for script in "$REPO_DIR"/scripts/*; do
+  [ -f "$script" ] || continue   # skips scripts/archive/ — retired, not installed
   name=$(basename "$script")
   target="$SCRIPTS_DIR/$name"
+
+  # agents.env is config the user is expected to edit — seed it, never clobber it
+  if [ "$name" = "agents.env" ]; then
+    if [ -f "$target" ]; then
+      if cmp -s "$script" "$target"; then
+        info "Kept existing $name"
+      else
+        warn "Kept your $name — upstream defaults changed, diff against $script"
+      fi
+    else
+      cp "$script" "$target"
+      success "Installed $name"
+    fi
+    continue
+  fi
+
   if [ -f "$target" ] && ! cmp -s "$script" "$target"; then
     warn "$name already exists and differs. Overwrite? (y/N)"
     read -r -n 1 reply
@@ -188,13 +205,8 @@ info "Updating $SETTINGS_FILE"
 
 REQUIRED_PERMS=(
   "Bash(codex exec *)"
-  "Bash(~/.claude/scripts/codex-review*)"
-  "Bash(~/.claude/scripts/codex-validate*)"
-  "Bash(~/.claude/scripts/codex-scout*)"
-  "Bash(~/.claude/scripts/codex-test*)"
   "Bash(~/.claude/scripts/parallel-review*)"
   "Bash(~/.claude/scripts/full-audit*)"
-  "Bash(~/.claude/scripts/best-of-n*)"
 )
 
 if [ ! -f "$SETTINGS_FILE" ]; then

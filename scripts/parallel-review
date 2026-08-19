@@ -6,7 +6,10 @@
 #   parallel-review --base main              # review branch diff against main
 #   parallel-review --agents 3               # force 3 agents (override auto-scoring)
 #   parallel-review --commit abc123          # review a specific commit
-#   parallel-review --codex-model gpt-5.4    # override Codex model
+#
+# Model overrides (defaults live in ~/.claude/scripts/agents.env):
+#   --codex-model <id>   --codex-effort  minimal|low|medium|high|xhigh
+#   --claude-model <id>  --claude-effort low|medium|high|xhigh|max
 #
 # Auto-scoring (when --agents is not set):
 #   Score 0  → formatting only, skip review
@@ -19,6 +22,9 @@
 
 set -uo pipefail
 
+# Resolve this script's dir BEFORE cd'ing — BASH_SOURCE may be a relative path
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 # Ensure we're in a git repo — find the root and cd there
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 if [ -z "$REPO_ROOT" ]; then
@@ -30,17 +36,32 @@ cd "$REPO_ROOT"
 BASE=""
 COMMIT=""
 AGENTS=""  # empty = auto-score
-CODEX_MODEL="gpt-5.4"
+
+# Shared model defaults — see agents.env; ORCHESTRA_* env vars override it, flags override those
+if [ -f "$SCRIPT_DIR/agents.env" ]; then . "$SCRIPT_DIR/agents.env"; fi
+CODEX_MODEL="${ORCHESTRA_CODEX_MODEL:-gpt-5.6-sol}"
+CODEX_EFFORT="${ORCHESTRA_CODEX_EFFORT:-high}"
+CLAUDE_MODEL="${ORCHESTRA_CLAUDE_MODEL:-opus}"
+CLAUDE_EFFORT="${ORCHESTRA_CLAUDE_EFFORT:-high}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --base)          BASE="$2"; shift 2 ;;
-    --commit)        COMMIT="$2"; shift 2 ;;
-    --agents)        AGENTS="$2"; shift 2 ;;
-    --codex-model)   CODEX_MODEL="$2"; shift 2 ;;
-    *)               shift ;;
+    --base)          BASE="${2:?--base requires a value}"; shift 2 ;;
+    --commit)        COMMIT="${2:?--commit requires a value}"; shift 2 ;;
+    --agents)        AGENTS="${2:?--agents requires a value}"; shift 2 ;;
+    --codex-model)   CODEX_MODEL="${2:?--codex-model requires a value}"; shift 2 ;;
+    --codex-effort)  CODEX_EFFORT="${2:?--codex-effort requires a value}"; shift 2 ;;
+    --claude-model)  CLAUDE_MODEL="${2:?--claude-model requires a value}"; shift 2 ;;
+    --claude-effort) CLAUDE_EFFORT="${2:?--claude-effort requires a value}"; shift 2 ;;
+    *)               echo "Unknown option: $1" >&2; exit 2 ;;
   esac
 done
+
+case "$AGENTS" in
+  "") ;;                                    # empty = auto-score
+  1|2|3) ;;
+  *) echo "--agents must be 1, 2, or 3 (got: $AGENTS)" >&2; exit 2 ;;
+esac
 
 # Build diff command based on scope
 DIFF_CMD="git diff HEAD"
@@ -136,20 +157,43 @@ if [ -z "$AGENTS" ]; then
   echo "Change complexity score: $SCORE → $AGENTS agent(s)" >&2
 fi
 
-echo "Starting parallel review ($AGENTS agent(s), codex: $CODEX_MODEL) — $FILE_COUNT files, $DIFF_LINES lines of diff..." >&2
+echo "Starting parallel review ($AGENTS agent(s), codex: $CODEX_MODEL/$CODEX_EFFORT, claude: $CLAUDE_MODEL/$CLAUDE_EFFORT) — $FILE_COUNT files, $DIFF_LINES lines of diff..." >&2
 
 # Temp files for each agent
-AGENT1_OUT=$(mktemp /tmp/review-agent1-XXXXXX.md)
-AGENT2_OUT=$(mktemp /tmp/review-agent2-XXXXXX.md)
-AGENT3_OUT=$(mktemp /tmp/review-agent3-XXXXXX.md)
-cleanup() { rm -f "$AGENT1_OUT" "$AGENT2_OUT" "$AGENT3_OUT"; }
+AGENT1_OUT=$(mktemp /tmp/review-agent1-XXXXXX)
+AGENT2_OUT=$(mktemp /tmp/review-agent2-XXXXXX)
+AGENT3_OUT=$(mktemp /tmp/review-agent3-XXXXXX)
+# stderr sinks get their own mktemp — a derived "$OUT.err" path is not exclusively created.
+# BSD mktemp only substitutes TRAILING X's — a ".md"/".err" suffix would make the path literal
+AGENT1_ERR=$(mktemp /tmp/review-agent1-err-XXXXXX)
+AGENT2_ERR=$(mktemp /tmp/review-agent2-err-XXXXXX)
+AGENT3_ERR=$(mktemp /tmp/review-agent3-err-XXXXXX)
+cleanup() {
+  rm -f "$AGENT1_OUT" "$AGENT2_OUT" "$AGENT3_OUT" "$AGENT1_ERR" "$AGENT2_ERR" "$AGENT3_ERR"
+}
 trap cleanup EXIT
+
+# Print an agent's result, or its stderr tail so a bad model/auth fails loudly
+emit() {
+  if [ -s "$1" ]; then
+    cat "$1"
+  else
+    echo "_No output_"
+    if [ -s "$2" ]; then
+      echo ""
+      echo '```'
+      tail -5 "$2"
+      echo '```'
+    fi
+  fi
+}
 
 PIDS=()
 
 # ── Agent 1: Codex — Security & Correctness (always runs) ────────────
 echo "$DIFF" | codex exec \
   --model "$CODEX_MODEL" \
+  -c model_reasoning_effort="$CODEX_EFFORT" \
   --sandbox read-only \
   --ephemeral \
   --output-last-message "$AGENT1_OUT" \
@@ -161,12 +205,12 @@ echo "$DIFF" | codex exec \
 - Type safety issues
 
 The diff is provided via stdin. Be specific: file names, line numbers, concrete impact. Skip style nits. If everything is fine, say so briefly." \
-  >/dev/null 2>&1 &
+  >/dev/null 2>"$AGENT1_ERR" &
 PIDS+=($!)
 
 # ── Agent 2: Claude — Architecture & Code Quality (score >= 2) ───────
 if [ "$AGENTS" -ge 2 ]; then
-  CLAUDE_PROMPT_FILE=$(mktemp /tmp/claude-prompt-XXXXXX.txt)
+  CLAUDE_PROMPT_FILE=$(mktemp /tmp/claude-prompt-XXXXXX)
   cat > "$CLAUDE_PROMPT_FILE" <<'PROMPT'
 You are reviewing code changes as part of a parallel review team. Another agent is reviewing for security and bugs — your focus is different.
 
@@ -183,10 +227,12 @@ Be specific: file names, line numbers, concrete suggestions. Skip security (anot
 PROMPT
 
   claude -p "$(cat "$CLAUDE_PROMPT_FILE")" \
+    --model "$CLAUDE_MODEL" \
+    --effort "$CLAUDE_EFFORT" \
     --allowedTools "Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*),Bash(git branch*)" \
     --output-format text \
     --no-session-persistence \
-    > "$AGENT2_OUT" 2>/dev/null &
+    > "$AGENT2_OUT" 2>"$AGENT2_ERR" &
   PIDS+=($!)
   rm -f "$CLAUDE_PROMPT_FILE"
 fi
@@ -195,6 +241,7 @@ fi
 if [ "$AGENTS" -ge 3 ]; then
   echo "$DIFF" | codex exec \
     --model "$CODEX_MODEL" \
+    -c model_reasoning_effort="$CODEX_EFFORT" \
     --sandbox read-only \
     --ephemeral \
     --output-last-message "$AGENT3_OUT" \
@@ -206,7 +253,7 @@ if [ "$AGENTS" -ge 3 ]; then
 - Potential regressions: could these changes break existing functionality?
 
 The diff is provided via stdin. Be specific: file names, line numbers, concrete scenarios that could fail. Skip style and architecture. If coverage looks good, say so briefly." \
-    >/dev/null 2>&1 &
+    >/dev/null 2>"$AGENT3_ERR" &
   PIDS+=($!)
 fi
 
@@ -227,20 +274,20 @@ fi
 echo "# Parallel Review (score: ${SCORE:-manual}, $AGENTS agent(s))"
 echo ""
 
-echo "## Agent 1 — Codex ($CODEX_MODEL): Security & Correctness"
+echo "## Agent 1 — Codex ($CODEX_MODEL, effort $CODEX_EFFORT): Security & Correctness"
 echo ""
-if [ -s "$AGENT1_OUT" ]; then cat "$AGENT1_OUT"; else echo "_No output_"; fi
+emit "$AGENT1_OUT" "$AGENT1_ERR"
 
 if [ "$AGENTS" -ge 2 ]; then
   echo ""
-  echo "## Agent 2 — Claude: Architecture & Code Quality"
+  echo "## Agent 2 — Claude ($CLAUDE_MODEL, effort $CLAUDE_EFFORT): Architecture & Code Quality"
   echo ""
-  if [ -s "$AGENT2_OUT" ]; then cat "$AGENT2_OUT"; else echo "_No output_"; fi
+  emit "$AGENT2_OUT" "$AGENT2_ERR"
 fi
 
 if [ "$AGENTS" -ge 3 ]; then
   echo ""
-  echo "## Agent 3 — Codex ($CODEX_MODEL): Edge Cases & Testing"
+  echo "## Agent 3 — Codex ($CODEX_MODEL, effort $CODEX_EFFORT): Edge Cases & Testing"
   echo ""
-  if [ -s "$AGENT3_OUT" ]; then cat "$AGENT3_OUT"; else echo "_No output_"; fi
+  emit "$AGENT3_OUT" "$AGENT3_ERR"
 fi

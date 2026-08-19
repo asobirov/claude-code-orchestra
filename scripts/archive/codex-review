@@ -1,0 +1,69 @@
+#!/bin/bash
+# codex-review — Ask Codex to review current changes (completely separate context from Claude)
+# Usage:
+#   codex-review                        # review uncommitted changes
+#   codex-review --base main            # review branch diff against main
+#   codex-review --commit abc123        # review a specific commit
+#   codex-review --base main "focus on auth logic"  # custom review prompt
+#
+#   codex-review --codex-model gpt-5.6-sol --codex-effort xhigh
+#
+# Unrecognized flags are forwarded to `codex exec review`. The last non-flag
+# argument is treated as a custom review prompt.
+
+set -euo pipefail
+
+# Resolve this script's dir BEFORE cd'ing — $0 may be a relative path
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$REPO_ROOT" ]; then echo "Not in a git repository." >&2; exit 1; fi
+cd "$REPO_ROOT"
+
+OUTPUT_FILE=$(mktemp /tmp/codex-review-XXXXXX)
+ERR_FILE=$(mktemp /tmp/codex-review-err-XXXXXX)  # own mktemp; trailing X's only (BSD)
+# Trap immediately: arg parsing below can exit via ${2:?...} before the final rm
+cleanup() { rm -f "$OUTPUT_FILE" "$ERR_FILE"; }
+trap cleanup EXIT
+
+# Shared model defaults — see agents.env; ORCHESTRA_* env vars override it, flags override those
+if [ -f "$SCRIPT_DIR/agents.env" ]; then . "$SCRIPT_DIR/agents.env"; fi
+CODEX_MODEL="${ORCHESTRA_CODEX_MODEL:-gpt-5.6-sol}"
+CODEX_EFFORT="${ORCHESTRA_CODEX_EFFORT:-high}"
+
+# Model/effort are consumed here rather than forwarded — codex rejects a repeated
+# --model, so passing our default plus the caller's would be a usage error.
+FWD=()
+HAS_SCOPE=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --codex-model|--model|-m) CODEX_MODEL="${2:?$1 requires a value}"; shift 2 ;;
+    --codex-effort)           CODEX_EFFORT="${2:?$1 requires a value}"; shift 2 ;;
+    --base|--commit)          HAS_SCOPE=true; FWD+=("$1" "${2:?$1 requires a value}"); shift 2 ;;
+    --uncommitted)            HAS_SCOPE=true; FWD+=("$1"); shift ;;
+    -o|--output-last-message|--ephemeral)
+      # this wrapper owns these; forwarding them would duplicate the flag
+      echo "$1 is managed by codex-review and cannot be overridden" >&2; exit 2 ;;
+    *)                        FWD+=("$1"); shift ;;
+  esac
+done
+
+# `codex exec review` is read-only by design and rejects --sandbox.
+ARGS=(--model "$CODEX_MODEL" -c model_reasoning_effort="$CODEX_EFFORT"
+      --ephemeral --output-last-message "$OUTPUT_FILE")
+if [ "$HAS_SCOPE" = false ]; then ARGS+=(--uncommitted); fi
+ARGS+=(${FWD[@]+"${FWD[@]}"})   # bash 3.2 treats an empty array as unset under `set -u`
+
+RC=0
+codex exec review "${ARGS[@]}" >/dev/null 2>"$ERR_FILE" || RC=$?
+
+# Output the review
+if [ -s "$OUTPUT_FILE" ]; then
+  cat "$OUTPUT_FILE"
+  if [ "$RC" -ne 0 ]; then echo "codex exited $RC after writing output" >&2; fi
+else
+  echo "Codex review produced no output." >&2
+  if [ -s "$ERR_FILE" ]; then tail -5 "$ERR_FILE" >&2; fi
+  if [ "$RC" -eq 0 ]; then RC=1; fi
+fi
+exit "$RC"

@@ -4,7 +4,10 @@
 # Usage:
 #   best-of-n "add input validation to the property create form"
 #   best-of-n --agents 3 "refactor the picker component to use a state machine"
-#   best-of-n --agents 2 --codex-model gpt-5.4 "fix the N+1 query in property listing"
+#   best-of-n --agents 2 --codex-model gpt-5.6-sol "fix the N+1 query in property listing"
+#
+# Model overrides (defaults live in ~/.claude/scripts/agents.env):
+#   --codex-model / --codex-effort / --claude-model / --claude-effort
 #
 # Flow:
 #   1. N agents implement the same task independently (separate contexts)
@@ -18,6 +21,9 @@
 
 set -uo pipefail
 
+# Resolve this script's dir BEFORE cd'ing — BASH_SOURCE may be a relative path
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 if [ -z "$REPO_ROOT" ]; then
   echo "Not in a git repository." >&2
@@ -26,14 +32,23 @@ fi
 cd "$REPO_ROOT"
 
 N=3
-CODEX_MODEL="gpt-5.4"
 TASK=""
+
+# Shared model defaults — see agents.env; ORCHESTRA_* env vars override it, flags override those
+if [ -f "$SCRIPT_DIR/agents.env" ]; then . "$SCRIPT_DIR/agents.env"; fi
+CODEX_MODEL="${ORCHESTRA_CODEX_MODEL:-gpt-5.6-sol}"
+CODEX_EFFORT="${ORCHESTRA_CODEX_EFFORT:-high}"
+CLAUDE_MODEL="${ORCHESTRA_CLAUDE_MODEL:-opus}"
+CLAUDE_EFFORT="${ORCHESTRA_CLAUDE_EFFORT:-high}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --agents)        N="$2"; shift 2 ;;
-    --codex-model)   CODEX_MODEL="$2"; shift 2 ;;
-    -*)              shift ;;
+    --agents)        N="${2:?--agents requires a value}"; shift 2 ;;
+    --codex-model)   CODEX_MODEL="${2:?--codex-model requires a value}"; shift 2 ;;
+    --codex-effort)  CODEX_EFFORT="${2:?--codex-effort requires a value}"; shift 2 ;;
+    --claude-model)  CLAUDE_MODEL="${2:?--claude-model requires a value}"; shift 2 ;;
+    --claude-effort) CLAUDE_EFFORT="${2:?--claude-effort requires a value}"; shift 2 ;;
+    -*)              echo "Unknown option: $1" >&2; exit 2 ;;
     *)
       if [ -z "$TASK" ]; then TASK="$1"; fi
       shift ;;
@@ -45,19 +60,32 @@ if [ -z "$TASK" ]; then
   exit 1
 fi
 
+# Guard before we spawn processes and temp files: N must be a small positive integer
+case "$N" in
+  ''|*[!0-9]*) echo "--agents must be a positive integer (got: $N)" >&2; exit 2 ;;
+esac
+if [ "$N" -lt 1 ] || [ "$N" -gt 8 ]; then
+  echo "--agents must be between 1 and 8 (got: $N)" >&2
+  exit 2
+fi
+
 echo "Spawning $N agents for: $TASK" >&2
 echo "Agents will implement independently, then a synthesizer picks the best." >&2
 
 # Create output files
 OUTPUTS=()
+ERRS=()   # stderr sinks get their own mktemp — a derived "$out.err" path is not exclusively created
 for i in $(seq 1 "$N"); do
-  OUTPUTS+=("$(mktemp /tmp/bon-agent${i}-XXXXXX.md)")
+  OUTPUTS+=("$(mktemp /tmp/bon-agent${i}-XXXXXX)")
+  ERRS+=("$(mktemp /tmp/bon-agent${i}-err-XXXXXX)")
 done
-SYNTH_OUT=$(mktemp /tmp/bon-synth-XXXXXX.md)
+SYNTH_OUT=$(mktemp /tmp/bon-synth-XXXXXX)
+SYNTH_ERR=$(mktemp /tmp/bon-synth-err-XXXXXX)
 
 cleanup() {
   for f in "${OUTPUTS[@]}"; do rm -f "$f"; done
-  rm -f "$SYNTH_OUT"
+  for f in "${ERRS[@]}"; do rm -f "$f"; done
+  rm -f "$SYNTH_OUT" "$SYNTH_ERR"
 }
 trap cleanup EXIT
 
@@ -66,10 +94,11 @@ PIDS=()
 for i in $(seq 1 "$N"); do
   idx=$((i - 1))
   out="${OUTPUTS[$idx]}"
+  err="${ERRS[$idx]}"
 
   if (( i % 2 == 1 )); then
     # Odd agents: Claude (full codebase access)
-    PROMPT_FILE=$(mktemp /tmp/bon-prompt-${i}-XXXXXX.txt)
+    PROMPT_FILE=$(mktemp /tmp/bon-prompt-${i}-XXXXXX)
     cat > "$PROMPT_FILE" <<PROMPT
 You are Agent $i of $N competing to produce the best implementation for a task.
 
@@ -84,17 +113,20 @@ Instructions:
 PROMPT
 
     claude -p "$(cat "$PROMPT_FILE")" \
+      --model "$CLAUDE_MODEL" \
+      --effort "$CLAUDE_EFFORT" \
       --allowedTools "Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*)" \
       --output-format text \
       --no-session-persistence \
-      > "$out" 2>/dev/null &
+      > "$out" 2>"$err" &
     PIDS+=($!)
     rm -f "$PROMPT_FILE"
-    echo "  Agent $i (Claude) started..." >&2
+    echo "  Agent $i (Claude $CLAUDE_MODEL) started..." >&2
   else
     # Even agents: Codex (workspace read-only — proposes changes without applying)
     codex exec \
       --model "$CODEX_MODEL" \
+      -c model_reasoning_effort="$CODEX_EFFORT" \
       --sandbox read-only \
       --ephemeral \
       --output-last-message "$out" \
@@ -108,7 +140,7 @@ Instructions:
 - Explain your approach and key decisions in 3-5 bullet points at the end
 - Focus on correctness, simplicity, and following existing patterns
 - Show the actual code changes (file paths + diffs or full replacement code)" \
-      >/dev/null 2>&1 &
+      >/dev/null 2>"$err" &
     PIDS+=($!)
     echo "  Agent $i (Codex $CODEX_MODEL) started..." >&2
   fi
@@ -133,7 +165,7 @@ for i in $(seq 1 "$N"); do
   idx=$((i - 1))
   out="${OUTPUTS[$idx]}"
   if (( i % 2 == 1 )); then
-    MODEL_LABEL="Claude"
+    MODEL_LABEL="Claude ($CLAUDE_MODEL)"
   else
     MODEL_LABEL="Codex ($CODEX_MODEL)"
   fi
@@ -158,7 +190,7 @@ done
 # ── Synthesizer: Claude reviews all solutions ────────────────────────
 echo "Running synthesizer..." >&2
 
-SYNTH_PROMPT_FILE=$(mktemp /tmp/bon-synth-prompt-XXXXXX.txt)
+SYNTH_PROMPT_FILE=$(mktemp /tmp/bon-synth-prompt-XXXXXX)
 cat > "$SYNTH_PROMPT_FILE" <<PROMPT
 You are a senior engineer synthesizing $N independent implementations of the same task.
 
@@ -175,31 +207,39 @@ $SYNTH_INPUT
 PROMPT
 
 claude -p "$(cat "$SYNTH_PROMPT_FILE")" \
+  --model "$CLAUDE_MODEL" \
+  --effort "$CLAUDE_EFFORT" \
   --allowedTools "Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*)" \
   --output-format text \
   --no-session-persistence \
-  > "$SYNTH_OUT" 2>/dev/null
+  > "$SYNTH_OUT" 2>"$SYNTH_ERR"
 
 rm -f "$SYNTH_PROMPT_FILE"
 
 # ── Output ────────────────────────────────────────────────────────────
 echo "# Best-of-$N Synthesis"
 echo ""
-echo "_Task: $TASK_"
+echo "_Task: ${TASK}_"
 echo ""
 
 for i in $(seq 1 "$N"); do
   idx=$((i - 1))
   out="${OUTPUTS[$idx]}"
+  err="${ERRS[$idx]}"
   if (( i % 2 == 1 )); then
-    MODEL_LABEL="Claude"
+    MODEL_LABEL="Claude ($CLAUDE_MODEL)"
   else
     MODEL_LABEL="Codex ($CODEX_MODEL)"
   fi
 
   echo "## Solution $i — $MODEL_LABEL"
   echo ""
-  if [ -s "$out" ]; then cat "$out"; else echo "_No output_"; fi
+  if [ -s "$out" ]; then
+    cat "$out"
+  else
+    echo "_No output_"
+    [ -s "$err" ] && { echo ""; echo '```'; tail -5 "$err"; echo '```'; }
+  fi
   echo ""
 done
 
@@ -207,4 +247,9 @@ echo "---"
 echo ""
 echo "## Synthesized Solution (Best of $N)"
 echo ""
-if [ -s "$SYNTH_OUT" ]; then cat "$SYNTH_OUT"; else echo "_Synthesizer produced no output_"; fi
+if [ -s "$SYNTH_OUT" ]; then
+  cat "$SYNTH_OUT"
+else
+  echo "_Synthesizer produced no output_"
+  [ -s "$SYNTH_ERR" ] && { echo ""; echo '```'; tail -5 "$SYNTH_ERR"; echo '```'; }
+fi

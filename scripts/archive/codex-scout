@@ -11,17 +11,25 @@
 
 set -uo pipefail
 
+# Resolve this script's dir BEFORE cd'ing — BASH_SOURCE may be a relative path
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 if [ -z "$REPO_ROOT" ]; then echo "Not in a git repository." >&2; exit 1; fi
 cd "$REPO_ROOT"
 
 AREA=""
-CODEX_MODEL="gpt-5.4"
+
+# Shared model defaults — see agents.env; ORCHESTRA_* env vars override it, flags override those
+if [ -f "$SCRIPT_DIR/agents.env" ]; then . "$SCRIPT_DIR/agents.env"; fi
+CODEX_MODEL="${ORCHESTRA_CODEX_MODEL:-gpt-5.6-sol}"
+CODEX_EFFORT="${ORCHESTRA_CODEX_EFFORT:-high}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --codex-model) CODEX_MODEL="$2"; shift 2 ;;
-    -*)            shift ;;
+    --codex-model)  CODEX_MODEL="${2:?--codex-model requires a value}"; shift 2 ;;
+    --codex-effort) CODEX_EFFORT="${2:?--codex-effort requires a value}"; shift 2 ;;
+    -*)            echo "Unknown option: $1" >&2; exit 2 ;;
     *)
       if [ -z "$AREA" ]; then AREA="$1"; fi
       shift ;;
@@ -33,12 +41,15 @@ if [ -z "$AREA" ]; then
   exit 1
 fi
 
-OUTPUT_FILE=$(mktemp /tmp/codex-scout-XXXXXX.md)
-cleanup() { rm -f "$OUTPUT_FILE"; }
+OUTPUT_FILE=$(mktemp /tmp/codex-scout-XXXXXX)
+ERR_FILE=$(mktemp /tmp/codex-scout-err-XXXXXX)  # own mktemp; trailing X's only (BSD)
+cleanup() { rm -f "$OUTPUT_FILE" "$ERR_FILE"; }
 trap cleanup EXIT
 
+RC=0
 codex exec \
   --model "$CODEX_MODEL" \
+  -c model_reasoning_effort="$CODEX_EFFORT" \
   --sandbox read-only \
   --ephemeral \
   --output-last-message "$OUTPUT_FILE" \
@@ -52,11 +63,14 @@ Find and read the relevant files, then provide a pre-implementation briefing:
 4. **Gotchas** — non-obvious constraints, edge cases, or things that look wrong but are intentional
 5. **Conventions** — naming, file structure, test patterns specific to this area
 
-Keep it concise. This briefing will be given to another agent before implementation." >/dev/null 2>&1
+Keep it concise. This briefing will be given to another agent before implementation." >/dev/null 2>"$ERR_FILE" || RC=$?
 
 if [ -s "$OUTPUT_FILE" ]; then
   cat "$OUTPUT_FILE"
+  if [ "$RC" -ne 0 ]; then echo "codex exited $RC after writing output" >&2; fi
 else
-  echo "Codex produced no output."
-  exit 1
+  echo "Codex produced no output." >&2
+  if [ -s "$ERR_FILE" ]; then tail -5 "$ERR_FILE" >&2; fi
+  if [ "$RC" -eq 0 ]; then RC=1; fi
 fi
+exit "$RC"
